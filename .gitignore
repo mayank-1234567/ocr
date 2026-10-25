@@ -1,0 +1,8 @@
+.venv/
+backend/.venv/
+backend/storage/
+backend/sample_book.pdf
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+.pytest_cache/

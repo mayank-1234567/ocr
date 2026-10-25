@@ -168,7 +168,7 @@ function App() {
     let idx = stepIndex + 1
     if (line[idx]) {
       try {
-        const reply = working.move(line[idx], { sloppy: true })
+        const reply = working.move(line[idx])
         if (reply) idx += 1
       } catch {
         // keep position if reply cannot be applied
@@ -234,7 +234,7 @@ function App() {
     const working = new Chess(game.fen())
     for (const san of currentPuzzle.parsed_solution_san.slice(stepIndex)) {
       try {
-        working.move(san, { sloppy: true })
+        working.move(san)
       } catch {
         break
       }
@@ -334,13 +334,15 @@ function App() {
               Puzzle {queueIndex + 1}/{queue.length} {currentPuzzle ? `· #${currentPuzzle.puzzle_number ?? currentPuzzle.id}` : ''}
             </p>
             <Chessboard
-              id="trainer-board"
-              position={game.fen()}
-              onPieceDrop={(sourceSquare, targetSquare) => {
-                void onMove(sourceSquare, targetSquare)
-                return true
+              options={{
+                position: game.fen(),
+                boardOrientation: orientation,
+                onPieceDrop: ({ sourceSquare, targetSquare }) => {
+                  if (!targetSquare) return false
+                  void onMove(sourceSquare, targetSquare)
+                  return true
+                },
               }}
-              boardOrientation={orientation}
             />
             <div className="row wrap">
               <button onClick={undoMove}>Undo</button>

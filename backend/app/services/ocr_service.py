@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import cv2
+import numpy as np
 import pytesseract
 
 
 class OCRService:
-    def extract_text(self, image_bytes: bytes) -> str:
+    def extract_text(self, image: np.ndarray) -> str:
         try:
-            return pytesseract.image_to_string(image_bytes)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            return pytesseract.image_to_string(gray)
         except Exception:
             return ""

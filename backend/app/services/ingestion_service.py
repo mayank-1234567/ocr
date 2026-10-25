@@ -13,6 +13,7 @@ from sqlmodel import Session, select
 from app.models import Book, ImportJob, Page, Puzzle
 from app.services.chess_engine_service import ChessEngineService
 from app.services.diagram_service import DiagramService
+from app.services.ocr_service import OCRService
 from app.services.pdf_service import PDFService
 from app.services.solution_service import SolutionService
 
@@ -27,6 +28,7 @@ class IngestionService:
         self.diagram = DiagramService()
         self.solution = SolutionService()
         self.engine = ChessEngineService()
+        self.ocr = OCRService()
 
     def _mark_book(self, session: Session, book: Book, status: str, progress: float, error: str | None = None) -> None:
         book.import_status = status
@@ -51,29 +53,35 @@ class IngestionService:
             total = len(pages) or 1
 
             for p in pages:
-                page = Page(
-                    book_id=book.id,
-                    page_index=p["index"],
-                    printed_page_number=str(p["index"] + 1),
-                    extracted_text=p["text"],
-                    layout_json={"blocks": p["blocks"]},
-                )
-                session.add(page)
-                session.commit()
-                session.refresh(page)
-
                 image = np.frombuffer(p["pixmap"].samples, dtype=np.uint8).reshape(p["pixmap"].height, p["pixmap"].width, p["pixmap"].n)
                 if p["pixmap"].n == 4:
                     image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
                 elif p["pixmap"].n == 1:
                     image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-                chapter_match = CHAPTER_RE.search(p["text"])
+                ocr_text = ""
+                if len(p["text"].strip()) < 40:
+                    ocr_text = self.ocr.extract_text(image)
+
+                page_text = p["text"] or ocr_text
+                page = Page(
+                    book_id=book.id,
+                    page_index=p["index"],
+                    printed_page_number=str(p["index"] + 1),
+                    extracted_text=page_text,
+                    ocr_text=ocr_text,
+                    layout_json={"blocks": p["blocks"]},
+                )
+                session.add(page)
+                session.commit()
+                session.refresh(page)
+
+                chapter_match = CHAPTER_RE.search(page_text)
                 chapter = chapter_match.group(1).strip() if chapter_match else None
-                puzzle_num_match = PUZZLE_NUM_RE.search(p["text"])
+                puzzle_num_match = PUZZLE_NUM_RE.search(page_text)
                 puzzle_num = puzzle_num_match.group(1) if puzzle_num_match else None
 
-                fen_text_matches = [m.group(1).strip() for m in FEN_RE.finditer(p["text"])]
+                fen_text_matches = [m.group(1).strip() for m in FEN_RE.finditer(page_text)]
                 diagrams = self.diagram.detect_diagrams(image)
 
                 if not fen_text_matches and not diagrams:
@@ -82,7 +90,7 @@ class IngestionService:
 
                 # Always create at least one puzzle candidate when diagram is detected.
                 candidates = fen_text_matches or [None] * max(1, len(diagrams))
-                san_candidates = self.solution.extract_san_candidates(p["text"])
+                san_candidates = self.solution.extract_san_candidates(page_text)
 
                 for i, fen_candidate in enumerate(candidates):
                     debug = {"page_index": p["index"], "diagrams": diagrams, "candidate_index": i}
@@ -93,6 +101,7 @@ class IngestionService:
 
                     fen = None
                     side = None
+                    side_hint = "b" if "black to move" in page_text.lower() else "w" if "white to move" in page_text.lower() else None
                     if fen_candidate:
                         chunks = fen_candidate.split()
                         if len(chunks) == 3:
@@ -129,7 +138,7 @@ class IngestionService:
                     if not fen:
                         # conservative placeholder for manual correction
                         fen = "8/8/8/8/8/8/8/8 w - - 0 1"
-                        side = "w"
+                        side = side_hint or "w"
                         confidence = min(confidence, 0.2)
 
                     puzzle = Puzzle(

@@ -3,6 +3,7 @@ import os
 import random
 import shutil
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -13,7 +14,6 @@ import chess.engine
 import fitz  # PyMuPDF
 import numpy as np
 from flask import Flask, jsonify, render_template_string, request, session
-from PIL import Image
 
 # Original AndrewSpano/2d-chess-ocr repository is cloned to this path in Docker.
 OCR_REPO = Path(os.environ.get("CHESS_OCR_REPO", "/opt/2d-chess-ocr"))
@@ -34,6 +34,8 @@ ACCEPTABLE_LOSS_CP = int(os.environ.get("ACCEPTABLE_LOSS_CP", "125"))
 MULTIPV = 8
 MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "160"))
 PDF_DPI_SCALE = float(os.environ.get("PDF_DPI_SCALE", "1.65"))
+MAX_IN_MEMORY_JOBS = int(os.environ.get("MAX_IN_MEMORY_JOBS", "6"))
+JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", "900"))
 
 ENGINE = None
 ENGINE_LOCK = threading.Lock()
@@ -42,6 +44,45 @@ OCR_LOCK = threading.Lock()
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-ocr")
+
+
+def _terminal_status(status):
+    return status in ("done", "error")
+
+
+def _job_timestamp(job):
+    return float(job.get("updated_at") or job.get("created_at") or 0.0)
+
+
+def cleanup_jobs_locked(now=None):
+    now = time.time() if now is None else now
+    expired = [
+        job_id for job_id, job in JOBS.items()
+        if _terminal_status(job.get("status")) and (now - _job_timestamp(job) > JOB_TTL_SECONDS)
+    ]
+    for job_id in expired:
+        JOBS.pop(job_id, None)
+    overflow = len(JOBS) - MAX_IN_MEMORY_JOBS
+    if overflow > 0:
+        by_age = sorted(
+            JOBS.items(),
+            key=lambda entry: (
+                not _terminal_status(entry[1].get("status")),
+                _job_timestamp(entry[1]),
+            ),
+        )
+        for job_id, _job in by_age[:overflow]:
+            JOBS.pop(job_id, None)
+
+
+def update_job(job_id, **fields):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job.update(fields)
+        job["updated_at"] = time.time()
+        cleanup_jobs_locked(now=job["updated_at"])
 
 
 def find_stockfish():
@@ -117,84 +158,79 @@ def detector_turn(det):
 def process_pdf(pdf_bytes, job_id):
     try:
         detector = get_ocr()
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        if doc.page_count == 0:
-            raise ValueError("This PDF has no pages.")
-        if doc.page_count > MAX_PDF_PAGES:
-            raise ValueError(
-                f"This PDF has {doc.page_count} pages. The current limit is {MAX_PDF_PAGES}; "
-                "split the book into smaller PDFs and upload them separately."
-            )
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            if doc.page_count == 0:
+                raise ValueError("This PDF has no pages.")
+            if doc.page_count > MAX_PDF_PAGES:
+                raise ValueError(
+                    f"This PDF has {doc.page_count} pages. The current limit is {MAX_PDF_PAGES}; "
+                    "split the book into smaller PDFs and upload them separately."
+                )
 
-        rows, invalid = [], 0
-        seen = set()
-        total = doc.page_count
-        for page_idx in range(total):
-            page = doc.load_page(page_idx)
-            pix = page.get_pixmap(matrix=fitz.Matrix(PDF_DPI_SCALE, PDF_DPI_SCALE), alpha=False)
-            image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            rgb = np.asarray(image)
-            bgr = rgb[:, :, ::-1].copy()
-            try:
-                results = detector.predict(bgr, imgsz=960)
-                detections, _unmatched = detector.to_fen(results)
-            except Exception:
-                app.logger.exception("2d-chess-ocr inference failed on PDF page %s", page_idx + 1)
-                invalid += 1
-                with JOBS_LOCK:
-                    if job_id in JOBS:
-                        JOBS[job_id].update(progress=int((page_idx + 1) * 100 / total), current_page=page_idx + 1)
-                continue
-
-            for board_idx, det in enumerate(detections):
-                placement = str(getattr(det, "fen", "") or "").strip()
-                if not placement or len(placement.split("/")) != 8:
-                    invalid += 1
-                    continue
-                turn, turn_conf = detector_turn(det)
-                # The detector supplies piece placement and inferred turn, not full game history.
-                fen = f"{placement} {turn} - - 0 1"
+            rows, invalid = [], 0
+            seen = set()
+            total = doc.page_count
+            for page_idx in range(total):
+                page = doc.load_page(page_idx)
+                pix = page.get_pixmap(matrix=fitz.Matrix(PDF_DPI_SCALE, PDF_DPI_SCALE), alpha=False)
+                rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
+                bgr = np.ascontiguousarray(rgb[:, :, :3][:, :, ::-1])
                 try:
-                    board = chess.Board(fen)
-                    if not board.is_valid() or board.is_game_over():
+                    results = detector.predict(bgr, imgsz=960)
+                    detections, _unmatched = detector.to_fen(results)
+                except Exception:
+                    app.logger.exception("2d-chess-ocr inference failed on PDF page %s", page_idx + 1)
+                    invalid += 1
+                    update_job(job_id, progress=int((page_idx + 1) * 100 / total), current_page=page_idx + 1)
+                    continue
+
+                for board_idx, det in enumerate(detections):
+                    placement = str(getattr(det, "fen", "") or "").strip()
+                    if not placement or len(placement.split("/")) != 8:
                         invalid += 1
                         continue
-                except ValueError:
-                    invalid += 1
-                    continue
-                key = (board.board_fen(), board.turn)
-                if key in seen:
-                    continue
-                seen.add(key)
-                rows.append({
-                    "id": f"p{page_idx + 1}-b{board_idx + 1}-{uuid.uuid4().hex[:8]}",
-                    "fen": board.fen(),
-                    "fen_piece_placement": placement,
-                    "turn": turn,
-                    "turn_conf": round(turn_conf, 3),
-                    "orientation": str(getattr(det, "orientation", "unknown") or "unknown"),
-                    "orientation_conf": round(float(getattr(det, "orientation_conf", 0.0) or 0.0), 3),
-                    "board_conf": round(float(getattr(det, "board_conf", 0.0) or 0.0), 3),
-                    "page": page_idx + 1,
-                    "board_index": board_idx + 1,
-                })
-            with JOBS_LOCK:
-                if job_id in JOBS:
-                    JOBS[job_id].update(progress=int((page_idx + 1) * 100 / total), current_page=page_idx + 1)
-        doc.close()
-        with JOBS_LOCK:
-            if job_id in JOBS:
-                JOBS[job_id].update(
-                    status="done", progress=100, positions=rows,
-                    rejected=invalid,
-                    message=(f"Extracted {len(rows)} unique valid positions from {total} PDF pages. "
-                             f"{invalid} detections were skipped because they were invalid or failed inference."),
-                )
+                    turn, turn_conf = detector_turn(det)
+                    # The detector supplies piece placement and inferred turn, not full game history.
+                    fen = f"{placement} {turn} - - 0 1"
+                    try:
+                        board = chess.Board(fen)
+                        if not board.is_valid() or board.is_game_over():
+                            invalid += 1
+                            continue
+                    except ValueError:
+                        invalid += 1
+                        continue
+                    key = (board.board_fen(), board.turn)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append({
+                        "id": f"p{page_idx + 1}-b{board_idx + 1}-{uuid.uuid4().hex[:8]}",
+                        "fen": board.fen(),
+                        "fen_piece_placement": placement,
+                        "turn": turn,
+                        "turn_conf": round(turn_conf, 3),
+                        "orientation": str(getattr(det, "orientation", "unknown") or "unknown"),
+                        "orientation_conf": round(float(getattr(det, "orientation_conf", 0.0) or 0.0), 3),
+                        "board_conf": round(float(getattr(det, "board_conf", 0.0) or 0.0), 3),
+                        "page": page_idx + 1,
+                        "board_index": board_idx + 1,
+                    })
+                update_job(job_id, progress=int((page_idx + 1) * 100 / total), current_page=page_idx + 1)
+        update_job(
+            job_id,
+            status="done",
+            progress=100,
+            positions=rows,
+            rejected=invalid,
+            message=(
+                f"Extracted {len(rows)} unique valid positions from {total} PDF pages. "
+                f"{invalid} detections were skipped because they were invalid or failed inference."
+            ),
+        )
     except Exception as exc:
         app.logger.exception("PDF processing failed")
-        with JOBS_LOCK:
-            if job_id in JOBS:
-                JOBS[job_id].update(status="error", progress=100, error=str(exc))
+        update_job(job_id, status="error", progress=100, error=str(exc))
 
 
 def score_cp(info, color):
@@ -266,10 +302,13 @@ def upload_pdf():
         return jsonify(ok=False, message="The uploaded file is empty."), 400
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
+        now = time.time()
         JOBS[job_id] = {
             "status": "processing", "progress": 0, "current_page": 0,
             "message": "Starting the 2d-chess-ocr model…",
+            "created_at": now, "updated_at": now,
         }
+        cleanup_jobs_locked(now=now)
     EXECUTOR.submit(process_pdf, payload, job_id)
     return jsonify(ok=True, job_id=job_id)
 
@@ -277,10 +316,15 @@ def upload_pdf():
 @app.get("/api/job/<job_id>")
 def job_status(job_id):
     with JOBS_LOCK:
+        cleanup_jobs_locked()
         job = JOBS.get(job_id)
         if not job:
             return jsonify(ok=False, message="Job not found. Upload the PDF again."), 404
-        return jsonify(ok=True, **job)
+        response = dict(job)
+        if response.get("status") == "done" and "positions" in response:
+            job.pop("positions", None)
+            job["updated_at"] = time.time()
+        return jsonify(ok=True, **response)
 
 
 @app.post("/api/new")
